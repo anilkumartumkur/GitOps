@@ -8,7 +8,7 @@ A GitOps-based deployment of the e-commerce microservices platform using **ArgoC
 
 ```
 GitOps/
-├── argocd-app.yaml              # 14 ArgoCD Application manifests
+├── argocd-app.yaml              # 15 ArgoCD Application manifests
 ├── kustomization.yaml           # Root Kustomize config
 │
 ├── base/                        # Base Kubernetes manifests (all environments)
@@ -21,11 +21,12 @@ GitOps/
 │   ├── frontend/
 │   ├── loadgenerator/
 │   ├── paymentservice/
-│   ├── postgres/
+│   ├── postgres/                # Legacy — authservice uses AWS RDS directly
 │   ├── productcatalogservice/
 │   ├── recommendationservice/
 │   ├── shippingservice/
-│   └── shoppingassistantservice/
+│   ├── shoppingassistantservice/
+│   └── vectordb/                # pgvector DB for shopping assistant
 │
 └── overlays/
     ├── microk8s/                # Single-node dev environment
@@ -64,7 +65,7 @@ Developer pushes code
 
 | Service | Image | Container Port | Service Port | Type |
 |---|---|---|---|---|
-| frontend | manojkrishnappa/frontend:**2** | 8080 | 80 (ClusterIP) / 80 (LoadBalancer) | HTTP |
+| frontend | manojkrishnappa/frontend:latest | 8080 | 80 (ClusterIP) / 80 (LoadBalancer) | HTTP |
 | authservice | manojkrishnappa/authservice:1 | 8081 | 8081 | HTTP |
 | productcatalogservice | manojkrishnappa/productcatalogservice:1 | 3550 | 3550 | gRPC |
 | cartservice | manojkrishnappa/cartservice:1 | 7070 | 7070 | gRPC |
@@ -76,17 +77,15 @@ Developer pushes code
 | emailservice | manojkrishnappa/emailservice:1 | 8080 | **5000** | gRPC |
 | recommendationservice | manojkrishnappa/recommendationservice:1 | 8080 | 8080 | gRPC |
 | adservice | manojkrishnappa/adservice:1 | 9555 | 9555 | gRPC |
-| shoppingassistantservice | manojkrishnappa/shoppingassistantservice:1 | 8080 | 80 | HTTP |
+| shoppingassistantservice | manojkrishnappa/shoppingassistantservice:latest | 8080 | 80 | HTTP |
 | loadgenerator | manojkrishnappa/loadgenerator:1 | — | — | None |
-| postgres | postgres:16-alpine | 5432 | 5432 | SQL |
+| vectordb | pgvector/pgvector:pg16 | 5432 | 5432 | SQL |
 
 > **Note:** emailservice has a port mismatch — container listens on `8080`, but the Kubernetes Service exposes `5000`. CheckoutService connects to `emailservice:5000`.
 
 ---
 
 ## How Services Are Connected (Environment Variables)
-
-The services find each other using Kubernetes DNS names injected as environment variables.
 
 ### Frontend → Backend Services
 ```yaml
@@ -123,29 +122,23 @@ REDIS_ADDR: "redis-cart:6379"
 
 ### LoadGenerator → Frontend
 ```yaml
-FRONTEND_ADDR: "frontend:80"   # Init container + main container
+FRONTEND_ADDR: "frontend:80"
 USERS:         "10"
 RATE:          "1"
 ```
 
-### AuthService → Postgres
+### ShoppingAssistantService → OpenAI + vectordb (from `shopping-assistant-secrets`)
 ```yaml
-# Connection built from secret:
-POSTGRES_DB:       "authdb"
-POSTGRES_USER:     "authuser"
-POSTGRES_PASSWORD: (from secret: postgres-secret/password)
+OPENAI_API_KEY:    <from K8s secret>
+LANGCHAIN_API_KEY: <from K8s secret>
+DATABASE_URL:      "postgresql+psycopg://authuser:<pass>@vectordb:5432/shoppingdb"
+COLLECTION_NAME:   products
 ```
 
-### ShoppingAssistantService → GCP
+### EmailService → Gmail SMTP (from `emailservice-secret`)
 ```yaml
-GOOGLE_API_KEY:        GOOGLE_API_KEY_VAL
-PROJECT_ID:            PROJECT_ID_VAL
-REGION:                REGION_VAL
-ALLOYDB_CLUSTER_NAME:  ALLOYDB_CLUSTER_NAME_VAL
-ALLOYDB_INSTANCE_NAME: ALLOYDB_INSTANCE_NAME_VAL
-ALLOYDB_DATABASE_NAME: ALLOYDB_DATABASE_NAME_VAL
-ALLOYDB_TABLE_NAME:    ALLOYDB_TABLE_NAME_VAL
-ALLOYDB_SECRET_NAME:   ALLOYDB_SECRET_NAME_VAL
+GMAIL_ADDRESS:      <from K8s secret>
+GMAIL_APP_PASSWORD: <from K8s secret>
 ```
 
 ---
@@ -178,21 +171,16 @@ ALLOYDB_SECRET_NAME:   ALLOYDB_SECRET_NAME_VAL
        ├──> Cart :7070
        ├──> Shipping :50051
        ├──> Payment :50051
-       └──> Email :5000 (container: 8080)
-          │
-          ▼
-      AuthService :8081
-          │
-          ▼
-       Postgres :5432 (authdb)
+       └──> Email :5000 (container: 8080) ──> smtp.gmail.com:587
+
+     AuthService :8081
+          └──> AWS RDS PostgreSQL (external)
 
      ShoppingAssistant :80
-          │
-          └──> Google Gemini API (external)
-          └──> AlloyDB (GCP, external)
+          ├──> OpenAI API (external) — GPT-4o vision + embeddings
+          └──> vectordb:5432 (pgvector, shoppingdb)
 
      LoadGenerator
-          │
           └──> frontend:80 (waits via init container, then load tests)
 ```
 
@@ -201,17 +189,17 @@ ALLOYDB_SECRET_NAME:   ALLOYDB_SECRET_NAME_VAL
 ## Kustomize Overlay Strategy
 
 ### Base (`base/`)
-Defines all raw Kubernetes manifests — Deployments, Services, ServiceAccounts.
+Defines all raw Kubernetes manifests — Deployments, Services, ServiceAccounts, ConfigMaps.
 All environment-specific customizations live in overlays.
 
 ### MicroK8s Overlay (`overlays/microk8s/`)
 For local single-node development.
 
 ```yaml
-Namespace:  default
+Namespace:    default
 All replicas: 1
-Image tags: all :1 (frontend :2)
-Labels: environment=microk8s
+Image tags:   all :1
+Labels:       environment=microk8s
 ```
 
 ### EKS Overlay (`overlays/eks/`) — Production Ready
@@ -246,11 +234,11 @@ Each service has its own ArgoCD `Application` resource pointing to its directory
 | frontend | base/frontend | default |
 | loadgenerator | base/loadgenerator | default |
 | paymentservice | base/paymentservice | default |
-| postgres | base/postgres | default |
 | productcatalogservice | base/productcatalogservice | default |
 | recommendationservice | base/recommendationservice | default |
 | shippingservice | base/shippingservice | default |
 | shoppingassistantservice | base/shoppingassistantservice | default |
+| vectordb | base/vectordb | default |
 
 All apps point to: `https://github.com/ITkannadigaru/GitOps.git` on branch `main`
 
@@ -261,18 +249,26 @@ All apps point to: `https://github.com/ITkannadigaru/GitOps.git` on branch `main
 Before deploying, these secrets must be created manually in the cluster:
 
 ```bash
-# Postgres credentials (used by postgres deployment and authservice)
+# Postgres password (used by vectordb deployment)
 kubectl create secret generic postgres-secret \
-  --from-literal=password=<your-password> \
-  -n default
+  --from-literal=password=<your-password>
 
-# JWT secret for authservice
+# JWT secret for authservice token signing
 kubectl create secret generic authservice-secret \
-  --from-literal=jwt-secret=<your-jwt-secret> \
-  -n default
-```
+  --from-literal=jwt-secret=<your-jwt-secret>
 
-> ShoppingAssistantService also needs `GOOGLE_API_KEY` and AlloyDB credentials, but it is **disabled by default** (`replicas: 0`).
+# OpenAI + vectordb credentials for shopping assistant
+kubectl create secret generic shopping-assistant-secrets \
+  --from-literal=OPENAI_API_KEY=sk-... \
+  --from-literal=LANGCHAIN_API_KEY=ls-... \
+  --from-literal=DATABASE_URL="postgresql+psycopg://authuser:<password>@vectordb:5432/shoppingdb" \
+  --from-literal=COLLECTION_NAME=products
+
+# Gmail credentials for email service
+kubectl create secret generic emailservice-secret \
+  --from-literal=GMAIL_ADDRESS=you@gmail.com \
+  --from-literal=GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
+```
 
 ---
 
@@ -309,7 +305,7 @@ Container level:
 | recommendationservice | 100m | 200m | 220Mi | 450Mi |
 | loadgenerator | 300m | 500m | 256Mi | 512Mi |
 | shoppingassistantservice | 100m | 500m | 256Mi | 512Mi |
-| postgres | 100m | 250m | 128Mi | 256Mi |
+| vectordb | 100m | 250m | 128Mi | 256Mi |
 
 ---
 
@@ -317,11 +313,12 @@ Container level:
 
 | Item | Detail |
 |---|---|
-| ShoppingAssistant is OFF | `replicas: 0` — needs GCP credentials to enable |
+| Email is LIVE | Sends real emails via Gmail SMTP — requires `emailservice-secret` with `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` |
+| ShoppingAssistant is LIVE | Migrated from GCP Gemini+AlloyDB to OpenAI GPT-4o+pgvector. Requires `shopping-assistant-secrets` |
 | Email port mismatch | Container: 8080 → Service: 5000. CheckoutService uses `emailservice:5000` |
 | Redis is ephemeral | Uses `emptyDir` — cart data is lost on pod restart |
-| Postgres is ephemeral | Uses `emptyDir` — user data is lost on pod restart |
+| AuthService uses AWS RDS | Connects to external RDS, not the in-cluster postgres |
+| vectordb auto-inits | ConfigMap runs `init.sql` on first startup — enables pgvector extension automatically |
 | Istio-ready | Frontend & LoadGenerator have `sidecar.istio.io/rewriteAppHTTPProbers: "true"` |
 | LoadGenerator init | Waits 12× (10s each) for frontend to be ready before sending traffic |
 | Image registry | All images on Docker Hub under `manojkrishnappa/` |
-| Frontend has 2 versions | All services tag `:1`, frontend is tag `:2` |
