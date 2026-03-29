@@ -28,7 +28,7 @@ spec:
               - ALL
           privileged: false
           readOnlyRootFilesystem: true
-        image: manojkrishnappa/shippingservice:92ee9bc2b156227326172efffffce2eba63c00c9
+        image: anilkumar1146/shippingservice:c760a2b16058a99f9f2292702569a85e84fcac28
         ports:
         - containerPort: 50051
         env:
