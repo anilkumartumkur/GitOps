@@ -29,7 +29,7 @@ spec:
               - ALL
           privileged: false
           readOnlyRootFilesystem: true
-        image: manojkrishnappa/productcatalogservice:bb4dedaf81135ec121155ec52c8f84aa4b5d5bf5
+        image: anilkumar1146/productcatalogservice:a410eb1c7641824a8ebdb5455e00e34784025b8b
         ports:
         - containerPort: 3550
         env:
